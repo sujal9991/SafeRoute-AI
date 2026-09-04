@@ -1,7 +1,21 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
 }
+
+val localProperties = Properties()
+val localPropertiesFile = rootProject.file("local.properties")
+
+if (localPropertiesFile.exists()) {
+    localPropertiesFile.inputStream().use {
+        localProperties.load(it)
+    }
+}
+
+val tomTomApiKey =
+    localProperties.getProperty("TOMTOM_API_KEY", "")
 
 android {
     namespace = "com.saferoute.ai"
@@ -19,6 +33,12 @@ android {
 
         testInstrumentationRunner =
             "androidx.test.runner.AndroidJUnitRunner"
+
+        buildConfigField(
+            "String",
+            "TOMTOM_API_KEY",
+            "\"$tomTomApiKey\""
+        )
     }
 
     buildTypes {
@@ -36,6 +56,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 }
 
@@ -57,20 +78,16 @@ dependencies {
 
     implementation(libs.androidx.lifecycle.runtime.ktx)
 
-    // Material icons
-    implementation(
-        "androidx.compose.material:material-icons-extended"
-    )
+    implementation("androidx.compose.material:material-icons-extended")
 
-    // Google Play Services Location
     implementation(
         "com.google.android.gms:play-services-location:21.3.0"
     )
 
-    // OpenStreetMap map engine
     implementation(
         "org.osmdroid:osmdroid-android:6.1.20"
     )
+
 
     testImplementation(libs.junit)
 

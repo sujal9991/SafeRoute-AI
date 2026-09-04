@@ -3,7 +3,7 @@
 <manifest
     xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Internet for OSM, Nominatim and OSRM -->
+    <!-- Internet for OSM, Nominatim, OSRM and TomTom -->
     <uses-permission
         android:name="android.permission.INTERNET" />
 
@@ -46,6 +46,15 @@
             </intent-filter>
 
         </activity>
+
+        <activity
+            android:name=".TomTomFlowTestActivity"
+            android:exported="true" />
+
+        <!-- Temporary TomTom API test screen -->
+        <activity
+            android:name=".TomTomTestActivity"
+            android:exported="true" />
 
         <!-- Background/continuous location service -->
         <service

@@ -1,5 +1,18 @@
 package com.saferoute.ai.ui
 
+import android.speech.tts.TextToSpeech
+import android.util.Log
+
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.unit.Dp
+import java.time.LocalTime
+import java.util.Locale
+import kotlin.math.atan2
+import kotlin.math.cos
+import kotlin.math.sin
+import kotlin.math.sqrt
+import kotlin.math.roundToInt
+
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
@@ -22,6 +35,10 @@ import com.saferoute.ai.navigation.calculateOsrmRoutes
 import com.saferoute.ai.util.formatDistance
 import com.saferoute.ai.util.formatDuration
 import com.saferoute.ai.search.searchNominatim
+import com.saferoute.ai.traffic.TomTomIncident
+import com.saferoute.ai.traffic.TomTomTrafficService
+import com.saferoute.ai.traffic.TomTomTrafficFlowService
+import com.saferoute.ai.traffic.TrafficFlowResult
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -86,12 +103,84 @@ fun ExploreScreen(
         mutableStateOf(false)
     }
 
+    var navigationMuted by remember {
+        mutableStateOf(false)
+    }
+
+    var textToSpeech by remember {
+        mutableStateOf<TextToSpeech?>(null)
+    }
+
+    var ttsReady by remember {
+        mutableStateOf(false)
+    }
+
+    var recenterRequest by remember {
+        mutableStateOf(0)
+    }
+
+    // ------------------------------------------------------------
+    // TOMTOM LIVE TRAFFIC INCIDENTS
+    // ------------------------------------------------------------
+
+    var trafficIncidents by remember {
+        mutableStateOf<List<TomTomIncident>>(emptyList())
+    }
+
+    var trafficLoading by remember {
+        mutableStateOf(false)
+    }
+
+    var trafficError by remember {
+        mutableStateOf<String?>(null)
+    }
+
+    // ------------------------------------------------------------
+    // TOMTOM LIVE TRAFFIC FLOW / ETA
+    // ------------------------------------------------------------
+
+    var trafficFlow by remember {
+        mutableStateOf<TrafficFlowResult?>(null)
+    }
+
+    var trafficFlowLoading by remember {
+        mutableStateOf(false)
+    }
+
+    var trafficFlowError by remember {
+        mutableStateOf<String?>(null)
+    }
+
     var showSearch by remember {
         mutableStateOf(openSearchInitially)
     }
 
     val scope =
-        androidx.compose.runtime.rememberCoroutineScope()
+        rememberCoroutineScope()
+
+    val context =
+        androidx.compose.ui.platform.LocalContext.current
+
+    DisposableEffect(Unit) {
+        val speaker = TextToSpeech(context, null)
+
+        val result = speaker.setLanguage(Locale.US)
+        speaker.setSpeechRate(0.95f)
+        speaker.setPitch(1.0f)
+
+        ttsReady =
+            result != TextToSpeech.LANG_MISSING_DATA &&
+                    result != TextToSpeech.LANG_NOT_SUPPORTED
+
+        textToSpeech = speaker
+
+        onDispose {
+            speaker.stop()
+            speaker.shutdown()
+            textToSpeech = null
+            ttsReady = false
+        }
+    }
 
     LaunchedEffect(openSearchInitially) {
         if (openSearchInitially) {
@@ -100,16 +189,22 @@ fun ExploreScreen(
         }
     }
 
+    // Calculate routes only when the destination changes, or when the first GPS fix arrives.
+    // Live GPS updates must NOT recalculate the route because that would reset an alternate
+    // route selection back to the fastest route.
     LaunchedEffect(
-        currentLocation,
-        destination
+        destination,
+        currentLocation == null
     ) {
-        if (
-            currentLocation == null ||
-            destination == null
-        ) {
+        if (destination == null || currentLocation == null) {
             return@LaunchedEffect
         }
+
+        val routeStart = currentLocation
+        val routeDestination = GeoPoint(
+            destination.latitude,
+            destination.longitude
+        )
 
         routeLoading = true
         routeError = null
@@ -120,24 +215,19 @@ fun ExploreScreen(
             val calculatedRoutes =
                 withContext(Dispatchers.IO) {
                     calculateOsrmRoutes(
-                        start = currentLocation,
-                        destination = GeoPoint(
-                            destination.latitude,
-                            destination.longitude
-                        )
+                        start = routeStart,
+                        destination = routeDestination
                     )
                 }
 
             routes = calculatedRoutes
 
             if (calculatedRoutes.isEmpty()) {
-                routeError =
-                    "No route was found."
+                routeError = "No route was found."
             }
-
         } catch (e: Exception) {
             routeError =
-                "Unable to calculate route:\n${e.message ?: "Unknown network error"}"
+                "Unable to calculate route: ${e.message ?: "Unknown network error"}"
         } finally {
             routeLoading = false
         }
@@ -212,6 +302,200 @@ fun ExploreScreen(
         }
     }
 
+    // ------------------------------------------------------------
+    // TOMTOM LIVE TRAFFIC INCIDENTS
+    // ------------------------------------------------------------
+
+    LaunchedEffect(routes, selectedRoute, isNavigating) {
+        if (routes.isEmpty()) {
+            trafficIncidents = emptyList()
+            trafficError = null
+            trafficLoading = false
+            return@LaunchedEffect
+        }
+
+        while (true) {
+            val route = routes.getOrNull(selectedRoute)
+
+            if (route == null || route.geometry.isEmpty()) {
+                trafficIncidents = emptyList()
+                trafficError = null
+                trafficLoading = false
+                return@LaunchedEffect
+            }
+
+            val routeMinLatitude = route.geometry.minOf { it.latitude }
+            val routeMaxLatitude = route.geometry.maxOf { it.latitude }
+            val routeMinLongitude = route.geometry.minOf { it.longitude }
+            val routeMaxLongitude = route.geometry.maxOf { it.longitude }
+
+            // Query a slightly wider corridor around the complete selected
+            // route. This catches incidents just beside the road instead of
+            // requiring the incident geometry to lie exactly on the route.
+            val latitudePadding = 0.03
+            val longitudePadding = 0.03
+
+            val minLatitude = (routeMinLatitude - latitudePadding).coerceIn(-90.0, 90.0)
+            val maxLatitude = (routeMaxLatitude + latitudePadding).coerceIn(-90.0, 90.0)
+            val minLongitude = (routeMinLongitude - longitudePadding).coerceIn(-180.0, 180.0)
+            val maxLongitude = (routeMaxLongitude + longitudePadding).coerceIn(-180.0, 180.0)
+
+            trafficLoading = true
+            trafficError = null
+
+            try {
+                val result = withContext(Dispatchers.IO) {
+                    TomTomTrafficService.getIncidents(
+                        minLongitude = minLongitude,
+                        minLatitude = minLatitude,
+                        maxLongitude = maxLongitude,
+                        maxLatitude = maxLatitude
+                    )
+                }
+
+                trafficIncidents = result
+
+                Log.d(
+                    "SafeRouteTomTom",
+                    "ExploreScreen received ${result.size} incidents"
+                )
+            } catch (e: Exception) {
+                trafficIncidents = emptyList()
+                trafficError =
+                    e.message ?: "Unable to load live traffic."
+
+                Log.e(
+                    "SafeRouteTomTom",
+                    "Traffic request failed",
+                    e
+                )
+            } finally {
+                trafficLoading = false
+            }
+
+            // Before navigation, one current snapshot is enough for route
+            // comparison. During navigation refresh every five minutes.
+            if (!isNavigating) {
+                return@LaunchedEffect
+            }
+
+            kotlinx.coroutines.delay(5 * 60 * 1000L)
+        }
+    }
+
+    // ------------------------------------------------------------
+    // TOMTOM LIVE TRAFFIC FLOW / TRAFFIC-AWARE ETA
+    // ------------------------------------------------------------
+
+    LaunchedEffect(routes, selectedRoute, isNavigating) {
+        if (routes.isEmpty()) {
+            trafficFlow = null
+            trafficFlowError = null
+            trafficFlowLoading = false
+            return@LaunchedEffect
+        }
+
+        while (true) {
+            val route = routes.getOrNull(selectedRoute)
+
+            if (route == null || route.geometry.size < 2) {
+                trafficFlow = null
+                trafficFlowError = null
+                trafficFlowLoading = false
+                return@LaunchedEffect
+            }
+
+            trafficFlowLoading = true
+            trafficFlowError = null
+
+            try {
+                val result = withContext(Dispatchers.IO) {
+                    TomTomTrafficFlowService.analyzeRoute(route.geometry)
+                }
+
+                trafficFlow = result
+
+                Log.d(
+                    "SafeRouteTomTomFlow",
+                    "Flow: level=${result.trafficLevel}, " +
+                            "relative=${result.averageRelativeSpeed}, " +
+                            "delay=${result.estimatedDelayFraction}, " +
+                            "matched=${result.matchedSegments}"
+                )
+            } catch (e: Exception) {
+                trafficFlow = null
+                trafficFlowError =
+                    e.message ?: "Unable to load traffic flow."
+
+                Log.e(
+                    "SafeRouteTomTomFlow",
+                    "Traffic flow request failed",
+                    e
+                )
+            } finally {
+                trafficFlowLoading = false
+            }
+
+            // Before navigation, one snapshot is enough for route comparison.
+            // During navigation, refresh the traffic-adjusted ETA every five minutes.
+            if (!isNavigating) {
+                return@LaunchedEffect
+            }
+
+            kotlinx.coroutines.delay(5 * 60 * 1000L)
+        }
+    }
+
+    // ------------------------------------------------------------
+    // SPOKEN TURN-BY-TURN NAVIGATION
+    // ------------------------------------------------------------
+
+    LaunchedEffect(
+        isNavigating,
+        navigationStepIndex,
+        navigationMuted,
+        ttsReady,
+        selectedRoute
+    ) {
+        if (
+            !isNavigating ||
+            navigationMuted ||
+            !ttsReady
+        ) {
+            return@LaunchedEffect
+        }
+
+        val route = routes.getOrNull(selectedRoute)
+            ?: return@LaunchedEffect
+
+        val step = route.steps.getOrNull(navigationStepIndex)
+            ?: return@LaunchedEffect
+
+        val instruction = step.instruction.trim()
+
+        if (instruction.isBlank()) {
+            return@LaunchedEffect
+        }
+
+        val distanceText = formatDistance(
+            step.distanceMeters
+        )
+
+        val spokenText =
+            if (step.distanceMeters > 0.0) {
+                "$instruction in approximately $distanceText."
+            } else {
+                instruction
+            }
+
+        textToSpeech?.speak(
+            spokenText,
+            TextToSpeech.QUEUE_FLUSH,
+            null,
+            "navigation_step_$navigationStepIndex"
+        )
+    }
+
     Scaffold(
         containerColor = Background
     ) { paddingValues ->
@@ -228,7 +512,8 @@ fun ExploreScreen(
                 destination = destination,
                 routes = routes,
                 selectedRoute = selectedRoute,
-                isNavigating = isNavigating
+                isNavigating = isNavigating,
+                recenterRequest = recenterRequest
             )
 
             Surface(
@@ -284,7 +569,7 @@ fun ExploreScreen(
                             },
 
                             modifier =
-                                Modifier.fillMaxWidth(),
+                                Modifier.weight(1f),
 
                             enabled =
                                 destination == null,
@@ -311,6 +596,23 @@ fun ExploreScreen(
                             shape =
                                 RoundedCornerShape(14.dp)
                         )
+
+
+                        if (
+                            routes.isNotEmpty() &&
+                            !isNavigating &&
+                            (trafficLoading ||
+                                    trafficIncidents.isNotEmpty() ||
+                                    trafficError != null)
+                        ) {
+                            Spacer(modifier = Modifier.height(6.dp))
+
+                            TrafficIncidentPill(
+                                incidents = trafficIncidents,
+                                loading = trafficLoading,
+                                error = trafficError
+                            )
+                        }
                     }
 
                     if (
@@ -576,6 +878,9 @@ fun ExploreScreen(
                     RouteResultCard(
                         routes = routes,
                         selectedRoute = selectedRoute,
+                        trafficFlow = trafficFlow,
+                        trafficFlowLoading = trafficFlowLoading,
+                        trafficFlowError = trafficFlowError,
                         onRouteSelected = {
                             selectedRoute = it
                             navigationStepIndex = 0
@@ -586,18 +891,26 @@ fun ExploreScreen(
                         }
                     )
                 }
+
             }
 
             if (isNavigating) {
-                NavigationPanel(
+                NavigationModeOverlay(
                     route = routes.getOrNull(selectedRoute),
+                    trafficFlow = trafficFlow,
                     stepIndex = navigationStepIndex,
                     distanceRemaining = navigationDistanceRemaining,
                     arrived = navigationArrived,
+                    muted = navigationMuted,
+                    recenterRequest = {
+                        recenterRequest++
+                    },
+                    onMute = { navigationMuted = !navigationMuted },
                     onEndNavigation = {
                         isNavigating = false
                         navigationArrived = false
                         navigationStepIndex = 0
+                        navigationMuted = false
                     }
                 )
             }
@@ -606,15 +919,19 @@ fun ExploreScreen(
 }
 
 // ============================================================
-// NAVIGATION PANEL
+// GOOGLE-STYLE NAVIGATION OVERLAY
 // ============================================================
 
 @Composable
-fun NavigationPanel(
+fun NavigationModeOverlay(
     route: RouteOption?,
+    trafficFlow: TrafficFlowResult?,
     stepIndex: Int,
+    recenterRequest: () -> Unit,
     distanceRemaining: Double,
     arrived: Boolean,
+    muted: Boolean,
+    onMute: () -> Unit,
     onEndNavigation: () -> Unit
 ) {
     val safeStepIndex =
@@ -624,113 +941,293 @@ fun NavigationPanel(
             0
         }
 
-    val instruction =
-        if (arrived) {
-            "You have arrived at your destination"
-        } else if (route != null && route.steps.isNotEmpty()) {
-            route.steps[safeStepIndex].instruction
+    val currentStep =
+        route?.steps?.getOrNull(safeStepIndex)
+
+    val nextStep =
+        route?.steps?.getOrNull(safeStepIndex + 1)
+
+    val trafficDelayFraction =
+        trafficFlow?.estimatedDelayFraction?.coerceIn(0.0, 3.0) ?: 0.0
+
+    val trafficAdjustedDurationSeconds =
+        route?.durationSeconds?.toDouble()?.times(1.0 + trafficDelayFraction) ?: 0.0
+
+    val remainingSeconds =
+        if (route != null && route.distanceMeters > 0.0) {
+            trafficAdjustedDurationSeconds *
+                    (distanceRemaining / route.distanceMeters)
         } else {
-            "Continue on the selected route"
+            0.0
         }
 
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(14.dp),
-        shape = RoundedCornerShape(20.dp),
-        colors = CardDefaults.cardColors(
-            containerColor = SurfaceColor
-        )
+    val eta = remember(remainingSeconds) {
+        LocalTime.now()
+            .plusSeconds(remainingSeconds.coerceAtLeast(0.0).toLong())
+    }
+
+    val etaText = String.format(
+        Locale.getDefault(),
+        "%d:%02d %s",
+        eta.hour % 12.let { if (it == 0) 12 else it },
+        eta.minute,
+        if (eta.hour < 12) "AM" else "PM"
+    )
+
+    Box(
+        modifier = Modifier.fillMaxSize()
     ) {
+        // ----------------------------------------------------
+        // TOP MANEUVER CARD
+        // ----------------------------------------------------
+
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            color = Color(0xFF00695C),
+            shape = RoundedCornerShape(18.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(
+                    start = 18.dp,
+                    end = 18.dp,
+                    top = 12.dp,
+                    bottom = 14.dp
+                )
+            ) {
+                if (arrived) {
+                    Text(
+                        text = "You have arrived",
+                        color = Color.White,
+                        fontSize = 27.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+
+                    Text(
+                        text = "Destination reached",
+                        color = Color.White.copy(alpha = 0.9f),
+                        fontSize = 15.sp
+                    )
+                } else {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = maneuverSymbol(currentStep?.instruction),
+                            color = Color.White,
+                            fontSize = 52.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.width(72.dp)
+                        )
+
+                        Column(
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text(
+                                text = formatDistance(
+                                    currentStep?.distanceMeters ?: 0.0
+                                ),
+                                color = Color.White,
+                                fontSize = 29.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+
+                            Text(
+                                text = navigationInstruction(currentStep),
+                                color = Color.White,
+                                fontSize = 17.sp,
+                                fontWeight = FontWeight.Medium,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+
+                    if (nextStep != null) {
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "Then",
+                                color = Color.White.copy(alpha = 0.78f),
+                                fontSize = 14.sp,
+                                modifier = Modifier.width(72.dp)
+                            )
+
+                            Text(
+                                text = maneuverSymbol(nextStep.instruction),
+                                color = Color.White.copy(alpha = 0.92f),
+                                fontSize = 27.sp
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // ----------------------------------------------------
+        // RIGHT-SIDE CONTROLS
+        // ----------------------------------------------------
+
         Column(
-            modifier = Modifier.padding(18.dp)
+            modifier = Modifier
+                .align(Alignment.CenterEnd)
+                .padding(end = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            NavigationRoundButton(
+                icon = Icons.Default.MyLocation,
+                contentDescription = "Recenter map",
+                onClick = recenterRequest
+            )
+
+            NavigationRoundButton(
+                icon = if (muted) {
+                    Icons.Default.VolumeOff
+                } else {
+                    Icons.Default.VolumeUp
+                },
+                contentDescription = if (muted) {
+                    "Unmute navigation"
+                } else {
+                    "Mute navigation"
+                },
+                onClick = onMute
+            )
+        }
+
+        // ----------------------------------------------------
+        // BOTTOM NAVIGATION BAR
+        // ----------------------------------------------------
+
+        Surface(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth(),
+            color = Color.Black,
+            shape = RoundedCornerShape(
+                topStart = 26.dp,
+                topEnd = 26.dp
+            )
         ) {
             Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(
+                        horizontal = 18.dp,
+                        vertical = 18.dp
+                    ),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Icon(
-                    imageVector = Icons.Default.Navigation,
-                    contentDescription = null,
-                    tint = Green,
-                    modifier = Modifier.size(30.dp)
+                NavigationRoundButton(
+                    icon = Icons.Default.Close,
+                    contentDescription = "End navigation",
+                    onClick = onEndNavigation,
+                    size = 58.dp
                 )
 
-                Spacer(
-                    modifier = Modifier.width(12.dp)
-                )
+                Spacer(modifier = Modifier.width(18.dp))
 
                 Column(
-                    modifier = Modifier.weight(1f)
+                    modifier = Modifier.weight(1f),
+                    horizontalAlignment = Alignment.CenterHorizontally
                 ) {
                     Text(
-                        text = if (arrived) "ARRIVED" else "NAVIGATING",
+                        text = if (arrived) {
+                            "Arrived"
+                        } else {
+                            formatDuration(remainingSeconds)
+                        },
                         color = Green,
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Bold
+                        fontSize = 29.sp,
+                        fontWeight = FontWeight.Medium
                     )
 
                     Text(
-                        text = instruction,
-                        color = TextPrimary,
-                        fontSize = 16.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        maxLines = 3,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-            }
-
-            Spacer(
-                modifier = Modifier.height(12.dp)
-            )
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Column {
-                    Text(
-                        text = "Remaining",
-                        color = TextTertiary,
-                        fontSize = 11.sp
-                    )
-
-                    Text(
-                        text = formatDistance(distanceRemaining),
-                        color = TextPrimary,
-                        fontSize = 15.sp,
-                        fontWeight = FontWeight.Bold
+                        text = if (arrived) {
+                            "Destination reached"
+                        } else {
+                            "${formatDistance(distanceRemaining)}  •  $etaText"
+                        },
+                        color = Color.White.copy(alpha = 0.82f),
+                        fontSize = 14.sp
                     )
                 }
 
-                if (!arrived) {
-                    Text(
-                        text = "Follow the green route",
-                        color = TextSecondary,
-                        fontSize = 12.sp
-                    )
+                Spacer(modifier = Modifier.width(18.dp))
+
+                Surface(
+                    modifier = Modifier.size(58.dp),
+                    shape = RoundedCornerShape(50),
+                    color = SurfaceLight
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = Icons.Default.AutoAwesome,
+                            contentDescription = null,
+                            tint = Green,
+                            modifier = Modifier.size(27.dp)
+                        )
+                    }
                 }
-            }
-
-            Spacer(
-                modifier = Modifier.height(12.dp)
-            )
-
-            Button(
-                onClick = onEndNavigation,
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(13.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = SurfaceLight,
-                    contentColor = TextPrimary
-                )
-            ) {
-                Text(
-                    text = if (arrived) "Done" else "End navigation",
-                    fontWeight = FontWeight.SemiBold
-                )
             }
         }
+    }
+}
+
+@Composable
+private fun NavigationRoundButton(
+    icon: ImageVector,
+    contentDescription: String,
+    onClick: () -> Unit,
+    size: Dp = 54.dp
+) {
+    Surface(
+        modifier = Modifier
+            .size(size)
+            .clickable(onClick = onClick),
+        shape = RoundedCornerShape(50),
+        color = Color.Black.copy(alpha = 0.90f),
+        border = BorderStroke(
+            1.dp,
+            Color.White.copy(alpha = 0.12f)
+        )
+    ) {
+        Box(contentAlignment = Alignment.Center) {
+            Icon(
+                imageVector = icon,
+                contentDescription = contentDescription,
+                tint = Color.White,
+                modifier = Modifier.size(27.dp)
+            )
+        }
+    }
+}
+
+private fun navigationInstruction(step: RouteStep?): String {
+    if (step == null || step.instruction.isBlank()) {
+        return "Continue on the route"
+    }
+
+    return step.instruction
+}
+
+private fun maneuverSymbol(instruction: String?): String {
+    val text = instruction?.lowercase().orEmpty()
+
+    return when {
+        "u-turn" in text || "uturn" in text -> "↶"
+        "sharp left" in text -> "↙"
+        "sharp right" in text -> "↘"
+        "left" in text -> "↰"
+        "right" in text -> "↱"
+        "roundabout" in text -> "⟳"
+        "straight" in text || "continue" in text -> "↑"
+        else -> "↑"
     }
 }
 
@@ -750,16 +1247,16 @@ private fun distanceBetweenMeters(
     val dLon = Math.toRadians(longitude2 - longitude1)
 
     val a =
-        kotlin.math.sin(dLat / 2) * kotlin.math.sin(dLat / 2) +
-                kotlin.math.cos(Math.toRadians(latitude1)) *
-                kotlin.math.cos(Math.toRadians(latitude2)) *
-                kotlin.math.sin(dLon / 2) *
-                kotlin.math.sin(dLon / 2)
+        sin(dLat / 2) * sin(dLat / 2) +
+                cos(Math.toRadians(latitude1)) *
+                cos(Math.toRadians(latitude2)) *
+                sin(dLon / 2) *
+                sin(dLon / 2)
 
     val c =
-        2.0 * kotlin.math.atan2(
-            kotlin.math.sqrt(a),
-            kotlin.math.sqrt(1.0 - a)
+        2.0 * atan2(
+            sqrt(a),
+            sqrt(1.0 - a)
         )
 
     return earthRadius * c
@@ -767,6 +1264,83 @@ private fun distanceBetweenMeters(
 
 // ============================================================
 // ============================================================
+
+@Composable
+private fun TrafficIncidentPill(
+    incidents: List<TomTomIncident>,
+    loading: Boolean,
+    error: String?
+) {
+    val severeCount = incidents.count {
+        it.magnitudeOfDelay.equals("major", ignoreCase = true) ||
+                it.magnitudeOfDelay.equals("veryMajor", ignoreCase = true)
+    }
+
+    val pillText = when {
+        loading -> "Checking traffic"
+        error != null -> "Traffic unavailable"
+        severeCount > 0 ->
+            "$severeCount major incident${if (severeCount == 1) "" else "s"}"
+        incidents.isNotEmpty() ->
+            "${incidents.size} traffic incident${if (incidents.size == 1) "" else "s"}"
+        else -> "Traffic clear"
+    }
+
+    val iconTint = when {
+        loading -> Green
+        error != null -> TextSecondary
+        severeCount > 0 -> Red
+        incidents.isNotEmpty() -> Color(0xFFFFB300)
+        else -> Green
+    }
+
+    Surface(
+        modifier = Modifier
+            .wrapContentWidth()
+            .padding(horizontal = 4.dp),
+        shape = RoundedCornerShape(50),
+        color = Color.Black.copy(alpha = 0.90f),
+        border = BorderStroke(
+            1.dp,
+            Color.White.copy(alpha = 0.14f)
+        ),
+        shadowElevation = 4.dp
+    ) {
+        Row(
+            modifier = Modifier.padding(
+                horizontal = 12.dp,
+                vertical = 7.dp
+            ),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            if (loading) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(15.dp),
+                    color = Green,
+                    strokeWidth = 2.dp
+                )
+            } else {
+                Icon(
+                    imageVector = Icons.Default.Traffic,
+                    contentDescription = "Live traffic",
+                    tint = iconTint,
+                    modifier = Modifier.size(18.dp)
+                )
+            }
+
+            Spacer(modifier = Modifier.width(7.dp))
+
+            Text(
+                text = pillText,
+                color = Color.White,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
 
 @Composable
 fun SearchResultItem(
@@ -826,6 +1400,9 @@ fun SearchResultItem(
 fun RouteResultCard(
     routes: List<RouteOption>,
     selectedRoute: Int,
+    trafficFlow: TrafficFlowResult?,
+    trafficFlowLoading: Boolean,
+    trafficFlowError: String?,
     onRouteSelected: (Int) -> Unit
 ) {
     Card(
@@ -932,15 +1509,64 @@ fun RouteResultCard(
                                     FontWeight.SemiBold
                             )
 
+                            val routeTrafficDelay =
+                                if (index == selectedRoute) {
+                                    trafficFlow?.estimatedDelayFraction
+                                        ?.coerceIn(0.0, 3.0) ?: 0.0
+                                } else {
+                                    0.0
+                                }
+
+                            val trafficAdjustedDuration =
+                                route.durationSeconds *
+                                        (1.0 + routeTrafficDelay)
+
                             Text(
                                 text =
                                     "${formatDistance(route.distanceMeters)} • " +
                                             formatDuration(
-                                                route.durationSeconds
+                                                trafficAdjustedDuration
                                             ),
                                 color = TextSecondary,
                                 fontSize = 11.sp
                             )
+
+                            if (index == selectedRoute) {
+                                val trafficText = when {
+                                    trafficFlowLoading -> "Checking live traffic..."
+                                    trafficFlowError != null -> "Traffic unavailable"
+                                    trafficFlow == null -> "Traffic data pending"
+                                    else -> {
+                                        val delayMinutes =
+                                            ((trafficAdjustedDuration -
+                                                    route.durationSeconds) / 60.0)
+                                                .roundToInt()
+                                                .coerceAtLeast(0)
+
+                                        val delayText =
+                                            if (delayMinutes > 0) {
+                                                " • +${delayMinutes} min"
+                                            } else {
+                                                ""
+                                            }
+
+                                        "Live traffic: ${trafficFlow.trafficLevel.lowercase()}" +
+                                                delayText
+                                    }
+                                }
+
+                                Text(
+                                    text = trafficText,
+                                    color = when {
+                                        trafficFlow?.trafficLevel == "HEAVY" ||
+                                                trafficFlow?.trafficLevel == "CLOSED" -> Red
+                                        trafficFlow?.trafficLevel == "MODERATE" -> Color(0xFFFFB300)
+                                        else -> Green
+                                    },
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
                         }
                     }
                 }
@@ -1043,3 +1669,5 @@ fun RouteResultCard(
 }
 
 // ============================================================
+
+
