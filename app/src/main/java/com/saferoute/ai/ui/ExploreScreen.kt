@@ -1,7 +1,10 @@
+
 package com.saferoute.ai.ui
 
 import android.speech.tts.TextToSpeech
 import android.util.Log
+
+import androidx.activity.compose.BackHandler
 
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.Dp
@@ -39,6 +42,8 @@ import com.saferoute.ai.traffic.TomTomIncident
 import com.saferoute.ai.traffic.TomTomTrafficService
 import com.saferoute.ai.traffic.TomTomTrafficFlowService
 import com.saferoute.ai.traffic.TrafficFlowResult
+import com.saferoute.ai.weather.WeatherResult
+import com.saferoute.ai.weather.WeatherService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -53,6 +58,7 @@ fun ExploreScreen(
     openSearchInitially: Boolean,
     onSearchOpened: () -> Unit,
     onDestinationSelected: (SearchResult) -> Unit,
+    onDestinationCleared: () -> Unit,
     onBack: () -> Unit
 ) {
     var searchText by remember {
@@ -151,6 +157,22 @@ fun ExploreScreen(
         mutableStateOf<String?>(null)
     }
 
+    // ------------------------------------------------------------
+    // WEATHER ALONG ROUTE
+    // ------------------------------------------------------------
+
+    var routeWeather by remember {
+        mutableStateOf<WeatherResult?>(null)
+    }
+
+    var weatherLoading by remember {
+        mutableStateOf(false)
+    }
+
+    var weatherError by remember {
+        mutableStateOf<String?>(null)
+    }
+
     var showSearch by remember {
         mutableStateOf(openSearchInitially)
     }
@@ -160,6 +182,64 @@ fun ExploreScreen(
 
     val context =
         androidx.compose.ui.platform.LocalContext.current
+
+    // ------------------------------------------------------------
+    // ANDROID SYSTEM BACK / EDGE-SWIPE
+    // ------------------------------------------------------------
+    //
+    // Android's gesture-navigation edge swipe triggers this BackHandler.
+    // Handle Back according to the current Explore state:
+    //
+    // 1. Navigation -> route preview
+    // 2. Search -> close search
+    // 3. Destination/routes -> clear route and stay on Explore
+    // 4. Normal Explore -> Home
+    //
+    BackHandler {
+        when {
+            isNavigating -> {
+                // Exit navigation but keep the selected route visible.
+                isNavigating = false
+                navigationArrived = false
+                navigationStepIndex = 0
+                navigationMuted = false
+            }
+
+            showSearch -> {
+                // Close the search UI first.
+                showSearch = false
+                searchResults = emptyList()
+                searching = false
+                routeError = null
+            }
+
+            destination != null || routes.isNotEmpty() -> {
+                // Clear the local Explore route state.
+                routes = emptyList()
+                selectedRoute = 0
+                navigationStepIndex = 0
+                navigationDistanceRemaining = 0.0
+                navigationArrived = false
+                navigationMuted = false
+
+                trafficIncidents = emptyList()
+                trafficFlow = null
+                routeWeather = null
+
+                trafficError = null
+                trafficFlowError = null
+                weatherError = null
+
+                // Tell MainActivity to clear the actual destination.
+                onDestinationCleared()
+            }
+
+            else -> {
+                // Normal Explore screen: return to Home.
+                onBack()
+            }
+        }
+    }
 
     DisposableEffect(Unit) {
         val speaker = TextToSpeech(context, null)
@@ -299,6 +379,58 @@ fun ExploreScreen(
             }
 
             navigationStepIndex = stepIndex
+        }
+    }
+
+    // ------------------------------------------------------------
+    // LIVE DESTINATION AUTOCOMPLETE
+    // ------------------------------------------------------------
+
+    LaunchedEffect(searchText, destination, showSearch) {
+        if (
+            destination != null ||
+            !showSearch ||
+            searchText.trim().length < 3
+        ) {
+            if (searchText.trim().length < 3) {
+                searchResults = emptyList()
+            }
+            return@LaunchedEffect
+        }
+
+        kotlinx.coroutines.delay(650L)
+
+        val query = searchText.trim()
+
+        try {
+            searching = true
+            routeError = null
+
+            val results = withContext(Dispatchers.IO) {
+                searchNominatim(
+                    query,
+                    currentLocation
+                )
+            }
+
+            // Ignore an older request if the user has already typed something else.
+            if (query == searchText.trim()) {
+                searchResults = results
+            }
+        } catch (e: Exception) {
+            if (query == searchText.trim()) {
+                searchResults = emptyList()
+            }
+
+            Log.e(
+                "SafeRouteSearch",
+                "Autocomplete failed",
+                e
+            )
+        } finally {
+            if (query == searchText.trim()) {
+                searching = false
+            }
         }
     }
 
@@ -447,6 +579,88 @@ fun ExploreScreen(
     }
 
     // ------------------------------------------------------------
+    // WEATHER ALONG ROUTE
+    // ------------------------------------------------------------
+
+    LaunchedEffect(routes, selectedRoute, isNavigating) {
+        Log.d(
+            "SafeRouteWeather",
+            "Weather effect started: routes=${routes.size}, selectedRoute=$selectedRoute, navigating=$isNavigating"
+        )
+
+        if (routes.isEmpty()) {
+            Log.d("SafeRouteWeather", "No routes yet - clearing weather state")
+            routeWeather = null
+            weatherError = null
+            weatherLoading = false
+            return@LaunchedEffect
+        }
+
+        while (true) {
+            val route = routes.getOrNull(selectedRoute)
+
+            if (route == null || route.geometry.isEmpty()) {
+                Log.d("SafeRouteWeather", "Selected route is unavailable or empty")
+                routeWeather = null
+                weatherError = null
+                weatherLoading = false
+                return@LaunchedEffect
+            }
+
+            // Use the route midpoint as the first representative weather sample.
+            val samplePoint = route.geometry[route.geometry.size / 2]
+
+            Log.d(
+                "SafeRouteWeather",
+                "Requesting weather at lat=${samplePoint.latitude}, lon=${samplePoint.longitude}"
+            )
+
+            weatherLoading = true
+            weatherError = null
+
+            try {
+                val result = withContext(Dispatchers.IO) {
+                    WeatherService.getWeather(
+                        latitude = samplePoint.latitude,
+                        longitude = samplePoint.longitude
+                    )
+                }
+
+                routeWeather = result
+
+                Log.d(
+                    "SafeRouteWeather",
+                    "Weather received: ${result.description}, " +
+                            "${result.temperatureC}°C, " +
+                            "rain=${result.precipitationMm}mm, " +
+                            "wind=${result.windSpeedKph}km/h, " +
+                            "severe=${result.isSevere}"
+                )
+            } catch (e: Exception) {
+                routeWeather = null
+                weatherError = e.message ?: "Unable to load weather."
+
+                Log.e(
+                    "SafeRouteWeather",
+                    "Weather request failed",
+                    e
+                )
+            } finally {
+                weatherLoading = false
+            }
+
+            // One snapshot is enough before navigation.
+            // During navigation refresh every ten minutes.
+            if (!isNavigating) {
+                Log.d("SafeRouteWeather", "Weather loaded; navigation is not active")
+                return@LaunchedEffect
+            }
+
+            kotlinx.coroutines.delay(10 * 60 * 1000L)
+        }
+    }
+
+    // ------------------------------------------------------------
     // SPOKEN TURN-BY-TURN NAVIGATION
     // ------------------------------------------------------------
 
@@ -562,9 +776,11 @@ fun ExploreScreen(
                             onValueChange = {
                                 if (destination == null) {
                                     searchText = it
-                                    searchResults =
-                                        emptyList()
                                     routeError = null
+
+                                    if (it.trim().isBlank()) {
+                                        searchResults = emptyList()
+                                    }
                                 }
                             },
 
@@ -613,6 +829,24 @@ fun ExploreScreen(
                                 error = trafficError
                             )
                         }
+
+                    }
+
+                    if (
+                        routes.isNotEmpty() &&
+                        !isNavigating &&
+                        (weatherLoading ||
+                                routeWeather != null ||
+                                weatherError != null)
+                    ) {
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        WeatherPill(
+                            weather = routeWeather,
+                            loading = weatherLoading,
+                            error = weatherError,
+                            modifier = Modifier.fillMaxWidth()
+                        )
                     }
 
                     if (
@@ -881,7 +1115,18 @@ fun ExploreScreen(
                         trafficFlow = trafficFlow,
                         trafficFlowLoading = trafficFlowLoading,
                         trafficFlowError = trafficFlowError,
+                        routeWeather = routeWeather,
+                        weatherLoading = weatherLoading,
+                        weatherError = weatherError,
                         onRouteSelected = {
+                            selectedRoute = it
+                            navigationStepIndex = 0
+                            navigationArrived = false
+                            navigationDistanceRemaining =
+                                routes[it].distanceMeters
+                            isNavigating = false
+                        },
+                        onStartNavigation = {
                             selectedRoute = it
                             navigationStepIndex = 0
                             navigationArrived = false
@@ -898,6 +1143,9 @@ fun ExploreScreen(
                 NavigationModeOverlay(
                     route = routes.getOrNull(selectedRoute),
                     trafficFlow = trafficFlow,
+                    routeWeather = routeWeather,
+                    weatherLoading = weatherLoading,
+                    weatherError = weatherError,
                     stepIndex = navigationStepIndex,
                     distanceRemaining = navigationDistanceRemaining,
                     arrived = navigationArrived,
@@ -918,7 +1166,6 @@ fun ExploreScreen(
     }
 }
 
-// ============================================================
 // GOOGLE-STYLE NAVIGATION OVERLAY
 // ============================================================
 
@@ -926,6 +1173,9 @@ fun ExploreScreen(
 fun NavigationModeOverlay(
     route: RouteOption?,
     trafficFlow: TrafficFlowResult?,
+    routeWeather: WeatherResult?,
+    weatherLoading: Boolean,
+    weatherError: String?,
     stepIndex: Int,
     recenterRequest: () -> Unit,
     distanceRemaining: Double,
@@ -978,13 +1228,27 @@ fun NavigationModeOverlay(
         modifier = Modifier.fillMaxSize()
     ) {
         // ----------------------------------------------------
+        // BACK TO ROUTE PREVIEW
+        // ----------------------------------------------------
+
+        NavigationRoundButton(
+            icon = Icons.Default.ArrowBack,
+            contentDescription = "Back to route preview",
+            onClick = onEndNavigation,
+            size = 52.dp,
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(start = 12.dp, top = 12.dp)
+        )
+
+        // ----------------------------------------------------
         // TOP MANEUVER CARD
         // ----------------------------------------------------
 
         Surface(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(12.dp),
+                .padding(start = 74.dp, end = 12.dp, top = 12.dp),
             color = Color(0xFF00695C),
             shape = RoundedCornerShape(18.dp)
         ) {
@@ -1062,6 +1326,61 @@ fun NavigationModeOverlay(
                                 color = Color.White.copy(alpha = 0.92f),
                                 fontSize = 27.sp
                             )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp),
+                        color = Color.Black.copy(alpha = 0.25f)
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 10.dp, vertical = 7.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = if (routeWeather?.isSevere == true) {
+                                    Icons.Default.Warning
+                                } else {
+                                    Icons.Default.WbSunny
+                                },
+                                contentDescription = "Live route weather",
+                                tint = if (routeWeather?.isSevere == true) Red else Green,
+                                modifier = Modifier.size(17.dp)
+                            )
+
+                            Spacer(modifier = Modifier.width(7.dp))
+
+                            Text(
+                                text = when {
+                                    weatherLoading -> "Updating weather..."
+                                    weatherError != null -> "Weather unavailable"
+                                    routeWeather == null -> "Weather pending"
+                                    else -> "${routeWeather.description} • " +
+                                            "${routeWeather.temperatureC.roundToInt()}°C • " +
+                                            "Rain ${routeWeather.precipitationMm} mm • " +
+                                            "Wind ${routeWeather.windSpeedKph.roundToInt()} km/h"
+                                },
+                                color = Color.White,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f)
+                            )
+
+                            if (routeWeather?.isSevere == true) {
+                                Text(
+                                    text = "SEVERE",
+                                    color = Red,
+                                    fontSize = 9.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
                         }
                     }
                 }
@@ -1184,10 +1503,11 @@ private fun NavigationRoundButton(
     icon: ImageVector,
     contentDescription: String,
     onClick: () -> Unit,
-    size: Dp = 54.dp
+    size: Dp = 54.dp,
+    modifier: Modifier = Modifier
 ) {
     Surface(
-        modifier = Modifier
+        modifier = modifier
             .size(size)
             .clickable(onClick = onClick),
         shape = RoundedCornerShape(50),
@@ -1264,6 +1584,77 @@ private fun distanceBetweenMeters(
 
 // ============================================================
 // ============================================================
+
+@Composable
+private fun WeatherPill(
+    weather: WeatherResult?,
+    loading: Boolean,
+    error: String?,
+    modifier: Modifier = Modifier
+) {
+    val pillText = when {
+        loading -> "Checking weather"
+        error != null -> "Weather unavailable"
+        weather == null -> "Weather pending"
+        else -> "${weather.description} • ${weather.temperatureC.roundToInt()}°C"
+    }
+
+    val iconTint = when {
+        loading -> Green
+        error != null -> TextSecondary
+        weather?.isSevere == true -> Red
+        else -> Green
+    }
+
+    Surface(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 4.dp),
+        shape = RoundedCornerShape(50),
+        color = Color.Black.copy(alpha = 0.90f),
+        border = BorderStroke(
+            1.dp,
+            Color.White.copy(alpha = 0.14f)
+        ),
+        shadowElevation = 4.dp
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(
+                    horizontal = 14.dp,
+                    vertical = 9.dp
+                ),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            if (loading) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(15.dp),
+                    color = Green,
+                    strokeWidth = 2.dp
+                )
+            } else {
+                Icon(
+                    imageVector = Icons.Default.WbSunny,
+                    contentDescription = "Weather",
+                    tint = iconTint,
+                    modifier = Modifier.size(18.dp)
+                )
+            }
+
+            Spacer(modifier = Modifier.width(7.dp))
+
+            Text(
+                text = pillText,
+                color = Color.White,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
 
 @Composable
 private fun TrafficIncidentPill(
@@ -1403,7 +1794,11 @@ fun RouteResultCard(
     trafficFlow: TrafficFlowResult?,
     trafficFlowLoading: Boolean,
     trafficFlowError: String?,
-    onRouteSelected: (Int) -> Unit
+    routeWeather: WeatherResult?,
+    weatherLoading: Boolean,
+    weatherError: String?,
+    onRouteSelected: (Int) -> Unit,
+    onStartNavigation: (Int) -> Unit
 ) {
     Card(
         modifier =
@@ -1422,6 +1817,107 @@ fun RouteResultCard(
             modifier =
                 Modifier.padding(16.dp)
         ) {
+
+            // --------------------------------------------------------
+            // WEATHER FOR THE SELECTED ROUTE
+            // --------------------------------------------------------
+
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(14.dp),
+                color = if (routeWeather?.isSevere == true) {
+                    Red.copy(alpha = 0.14f)
+                } else {
+                    GreenDark.copy(alpha = 0.55f)
+                },
+                border = BorderStroke(
+                    1.dp,
+                    if (routeWeather?.isSevere == true) {
+                        Red.copy(alpha = 0.55f)
+                    } else {
+                        Green.copy(alpha = 0.35f)
+                    }
+                )
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 13.dp, vertical = 11.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (weatherLoading) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(20.dp),
+                            color = Green,
+                            strokeWidth = 2.dp
+                        )
+                    } else {
+                        Icon(
+                            imageVector = if (routeWeather?.isSevere == true) {
+                                Icons.Default.Warning
+                            } else {
+                                Icons.Default.WbSunny
+                            },
+                            contentDescription = "Route weather",
+                            tint = if (routeWeather?.isSevere == true) {
+                                Red
+                            } else {
+                                Green
+                            },
+                            modifier = Modifier.size(22.dp)
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.width(10.dp))
+
+                    Column(
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text(
+                            text = when {
+                                weatherLoading -> "Checking route weather..."
+                                weatherError != null -> "Weather unavailable"
+                                routeWeather == null -> "Weather data pending"
+                                else -> "Weather along route"
+                            },
+                            color = TextPrimary,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+
+                        Text(
+                            text = when {
+                                weatherLoading -> "Getting current conditions"
+                                weatherError != null -> weatherError
+                                    ?: "Unable to load weather"
+                                routeWeather == null -> "Waiting for weather data"
+                                else -> "${routeWeather.description}  •  " +
+                                        "${routeWeather.temperatureC.roundToInt()}°C  •  " +
+                                        "Rain ${routeWeather.precipitationMm} mm  •  " +
+                                        "Wind ${routeWeather.windSpeedKph.roundToInt()} km/h"
+                            },
+                            color = TextSecondary,
+                            fontSize = 11.sp,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+
+                    if (routeWeather?.isSevere == true) {
+                        Text(
+                            text = "SEVERE",
+                            color = Red,
+                            fontSize = 9.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+            }
+
+            Spacer(
+                modifier =
+                    Modifier.height(12.dp)
+            )
 
             Text(
                 text = "Available routes",
@@ -1664,10 +2160,35 @@ fun RouteResultCard(
                         }
                     }
                 }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Button(
+                onClick = {
+                    onStartNavigation(safeIndex)
+                },
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(14.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Green,
+                    contentColor = Background
+                )
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Navigation,
+                    contentDescription = null
+                )
+
+                Spacer(modifier = Modifier.width(8.dp))
+
+                Text(
+                    text = "Start Navigation",
+                    fontWeight = FontWeight.Bold
+                )
+            }
         }
     }
 }
 
 // ============================================================
-
 
